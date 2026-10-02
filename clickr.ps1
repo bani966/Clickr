@@ -125,6 +125,15 @@ function Get-Controller {
     Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains $UdeHwid }
 }
 
+# Status 'OK' lies: a stopped controller still shows OK. Only the DN_STARTED bit (0x8) means usbip.exe can reach it.
+function Test-Started([string]$instanceId) {
+    [bool]((Get-PnpDeviceProperty -InstanceId $instanceId -KeyName DEVPKEY_Device_DevNodeStatus -ErrorAction SilentlyContinue).Data -band 0x8)
+}
+
+function Get-WorkingController {
+    Get-Controller | Where-Object { Test-Started $_.InstanceId }
+}
+
 function Get-OwnDriverPackages {
     Get-WindowsDriver -Online -ErrorAction SilentlyContinue |
         Where-Object { $DriverInfs -contains (Split-Path $_.OriginalFileName -Leaf) }
@@ -183,15 +192,24 @@ function Setup-Clickr {
     Invoke-Logged $python @('-m', 'pip', 'install', '--user', '--upgrade', '--disable-pip-version-check', 'pystray', 'pillow') 600
     if ($LASTEXITCODE -ne 0) { Write-Log 'ERROR: pip install failed. See above.'; return 1 }
 
-    if (Get-Controller | Where-Object Status -eq 'OK') { Write-Log 'Driver already installed. Done.'; return 0 }
-    Write-Log 'Installing the driver. Click Yes on the admin prompt. USB devices drop out for a second or two.'
+    if (Get-WorkingController) { Write-Log 'Driver already installed and running. Done.'; return 0 }
+    if (Get-Controller) { Write-Log 'Driver is installed but stopped. Restarting it. Click Yes on the admin prompt.' }
+    else { Write-Log 'Installing the driver. Click Yes on the admin prompt. USB devices drop out for a second or two.' }
     if (Test-Admin) { Install-Clickr } else { Invoke-Elevated 'install' }
 }
 
 function Install-Clickr {
     $ErrorActionPreference = 'Stop'
     try {
-        if (Get-OwnDriverPackages) { Write-Log 'Already installed. Run "clickr.ps1 uninstall" first to reinstall.'; return 0 }
+        if (Get-OwnDriverPackages) {
+            $stopped = @(Get-Controller | Where-Object { -not (Test-Started $_.InstanceId) })
+            if (-not $stopped) { Write-Log 'Already installed and running.'; return 0 }
+            # Happens after an interrupted uninstall: installed, but Windows never started it again.
+            foreach ($c in $stopped) { Invoke-Logged "$System32\pnputil.exe" @('/restart-device', $c.InstanceId) 60 }
+            if (Wait-Until { Get-WorkingController } 10) { Write-Log 'Driver restarted and running.'; return 0 }
+            Write-Log 'ERROR: driver still stopped. Run Uninstall.bat, reboot, then Install.bat.'
+            return 1
+        }
 
         # uninstall must never touch these. Record them now.
         $preexisting = @(Get-PnpDevice -ErrorAction SilentlyContinue |
@@ -212,7 +230,7 @@ function Install-Clickr {
             Preexisting = $preexisting
         } | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
 
-        if ($packages.Count -ne 2 -or -not ($controller | Where-Object Status -eq 'OK')) {
+        if ($packages.Count -ne 2 -or -not (Wait-Until { Get-WorkingController } 10)) {
             Write-Log 'WARNING: install incomplete (expected 2 driver packages and a working controller). Run "clickr.ps1 uninstall" to roll back.'
             return 1
         }
@@ -225,8 +243,8 @@ function Install-Clickr {
 }
 
 function Start-Clickr {
-    if (-not (Get-Controller | Where-Object Status -eq 'OK')) {
-        Write-Log 'ERROR: drivers not installed. Run "clickr.ps1 install" first.'
+    if (-not (Get-WorkingController)) {
+        Write-Log $(if (Get-Controller) { 'ERROR: driver is stopped. Run Install.bat to fix it.' } else { 'ERROR: driver not installed. Run Install.bat.' })
         return 1
     }
     $status = Get-DeviceStatus
