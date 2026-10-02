@@ -10,7 +10,7 @@ ClassGuid={36FC9E60-C465-11CF-8056-444553540000} ; Devguid.h, GUID_DEVCLASS_USB,
 Provider=%Manufacturer%
 CatalogFile=usbip2_ude.cat ; do not modify, used by setup.iss for searching drivers for uninstallation
 PnpLockDown=1
-DriverVer = 07/03/2026,1.45.29.368
+DriverVer = 08/26/2026,23.56.48.757
 
 [DestinationDirs]
 DefaultDestDir = 13 ; Driver package isolation

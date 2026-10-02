@@ -12,7 +12,7 @@ Provider = %Manufacturer%
 ExtensionId = {c1e0d1fe-d564-596e-4526-71da1249702a}
 CatalogFile = usbip2_filter.cat
 PnpLockDown = 1
-DriverVer = 07/03/2026,1.45.28.868
+DriverVer = 08/26/2026,23.56.30.686
 
 [DestinationDirs]
 DefaultDestDir = 13 ; DriverStore

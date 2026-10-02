@@ -46,5 +46,5 @@ Reinstalling? Reboot between `Uninstall.bat` and `Install.bat`.
 
 ## Credits
 
-Driver: [usbip-win2](https://github.com/vadimgrn/usbip-win2) 0.9.7.8, BSD 2-Clause (`LICENSE-usbip-win2.txt`).
+Driver: [usbip-win2](https://github.com/vadimgrn/usbip-win2) 0.9.8.0, BSD 2-Clause (`LICENSE-usbip-win2.txt`).
 USB ID: [pid.codes](https://pid.codes) test ID `1209:0001`.

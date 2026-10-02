@@ -22,6 +22,8 @@ $BusId       = '1-1'
 $UdeHwid     = 'ROOT\USBIP_WIN2\UDE'
 $DriverInfs  = 'usbip2_filter.inf', 'usbip2_ude.inf'
 $Services    = 'usbip2_ude', 'usbip2_filter'
+$ShutdownTask = 'Clickr Detach On Shutdown'
+$Tasks       = $ShutdownTask, 'USBip Detach All On Reboot Or Shutdown'  # 2nd: made by the official USBip installer
 $KeepLogs    = 20
 # The controller's instance ID is ROOT\USB\<n>, not its hardware ID. Find it by hardware ID, never by name.
 $OwnDevicePattern = '^(USB\\ROOT_HUB30|USB\\VID_1209&PID_0001|HID\\VID_1209&PID_0001)'
@@ -163,6 +165,57 @@ function Get-OwnPorts {
     }
 }
 
+# Get-ScheduledTask can't see admin-made tasks from a normal session, and Test-Path says $true for any key it
+# can't read. Opening the task-cache key works: null = missing, access denied = exists.
+function Test-TaskExists([string]$name) {
+    try {
+        $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\$name")
+        if ($k) { $k.Close(); return $true }
+        $false
+    } catch [System.Security.SecurityException] { $true }
+}
+
+# usbip-win2's own installer ships this too: an attached virtual device can hang a restart. Detach first.
+function Register-ShutdownTask {
+    $xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Author>Clickr</Author><Description>Clickr: unplug the virtual mouse before restart or shutdown</Description></RegistrationInfo>
+  <Triggers>
+    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="System"&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and (EventID=109)]] or *[System[Provider[@Name='User32'] and (EventID=1074)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+    </EventTrigger>
+  </Triggers>
+  <Principals><Principal id="LocalService"><UserId>S-1-5-19</UserId><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT30S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="LocalService"><Exec><Command>$Bin\usbip.exe</Command><Arguments>detach --all=closeonly</Arguments></Exec></Actions>
+</Task>
+"@
+    Register-ScheduledTask -TaskName $ShutdownTask -Xml $xml -Force | Out-Null
+    Write-Log "Scheduled task `"$ShutdownTask`" registered."
+}
+
+# The filter sits on EVERY USB 3 root hub, real ones included (upstream design). It's listed under
+# Enum\<hub>\Filters\*Upper, not in the UpperFilters property. Left behind on a real hub = that hub may not start.
+function Get-HubsWithFilter {
+    Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Enum\USB\ROOT_HUB30' -ErrorAction SilentlyContinue | Where-Object {
+        $k = Get-Item -LiteralPath "$($_.PSPath)\Filters\*Upper" -ErrorAction SilentlyContinue
+        $k -and ($k.GetValueNames() -contains 'usbip2_filter')
+    } | ForEach-Object { "USB\ROOT_HUB30\$($_.PSChildName)" }
+}
+
 function Test-Leftover([string]$label, $items) {
     $items = @($items | Where-Object { $_ })
     Write-Log ('{0}: {1}' -f $label, $(if ($items) { $items -join ', ' } else { 'none' }))
@@ -192,8 +245,10 @@ function Setup-Clickr {
     Invoke-Logged $python @('-m', 'pip', 'install', '--user', '--upgrade', '--disable-pip-version-check', 'pystray', 'pillow') 600
     if ($LASTEXITCODE -ne 0) { Write-Log 'ERROR: pip install failed. See above.'; return 1 }
 
-    if (Get-WorkingController) { Write-Log 'Driver already installed and running. Done.'; return 0 }
-    if (Get-Controller) { Write-Log 'Driver is installed but stopped. Restarting it. Click Yes on the admin prompt.' }
+    $hasTask = Test-TaskExists $ShutdownTask
+    if ((Get-WorkingController) -and $hasTask) { Write-Log 'Driver already installed and running. Done.'; return 0 }
+    if (Get-WorkingController) { Write-Log 'Adding the shutdown task. Click Yes on the admin prompt.' }
+    elseif (Get-Controller) { Write-Log 'Driver is installed but stopped. Restarting it. Click Yes on the admin prompt.' }
     else { Write-Log 'Installing the driver. Click Yes on the admin prompt. USB devices drop out for a second or two.' }
     if (Test-Admin) { Install-Clickr } else { Invoke-Elevated 'install' }
 }
@@ -203,6 +258,7 @@ function Install-Clickr {
     try {
         if (Get-OwnDriverPackages) {
             $stopped = @(Get-Controller | Where-Object { -not (Test-Started $_.InstanceId) })
+            Register-ShutdownTask
             if (-not $stopped) { Write-Log 'Already installed and running.'; return 0 }
             # Happens after an interrupted uninstall: installed, but Windows never started it again.
             foreach ($c in $stopped) { Invoke-Logged "$System32\pnputil.exe" @('/restart-device', $c.InstanceId) 60 }
@@ -223,6 +279,7 @@ function Install-Clickr {
         foreach ($p in $packages) { Write-Log "Driver store: $($p.Driver) <- $(Split-Path $p.OriginalFileName -Leaf) $($p.Version)" }
         $controller = Get-Controller
         foreach ($d in $controller) { Write-Log "Device: $($d.InstanceId) [$($d.Status)] $($d.FriendlyName)" }
+        Register-ShutdownTask
 
         [pscustomobject]@{
             InstalledAt = (Get-Date).ToString('s')
@@ -257,7 +314,7 @@ function Start-Clickr {
         if (-not $status) { Write-Log "ERROR: device didn't start. See device.log."; return 1 }
     }
     if ($status -match 'detached') {
-        Invoke-Logged "$Bin\usbip.exe" @('attach', '-r', $Address, '-b', $BusId, '--once') 30
+        Invoke-Logged "$Bin\usbip.exe" @('attach', '-r', $Address, '-b', $BusId, '--once', '--receive-mode=low-latency') 30
         $status = Wait-Until { $s = Get-DeviceStatus; if ($s -match ' attached') { $s } } 5
     }
     if ("$status" -notmatch ' attached') { Write-Log 'ERROR: mouse did not attach.'; return 1 }  # quotes: $null -notmatch is not $true
@@ -294,26 +351,28 @@ function Uninstall-Clickr {
     foreach ($d in Get-OwnDevices $preexisting) {
         Invoke-Logged "$System32\pnputil.exe" @('/remove-device', $d.InstanceId)
     }
+    $filteredHubs = @(Get-HubsWithFilter)
     foreach ($svc in $Services) {
-        if (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$svc") { Invoke-Logged "$System32\sc.exe" @('delete', $svc) }
+        if (-not (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$svc")) { continue }
+        # Never delete the filter's service while a hub still lists it: that hub (maybe your real USB) won't start.
+        if ($svc -eq 'usbip2_filter' -and $filteredHubs) { Write-Log "Kept service usbip2_filter: still listed on $($filteredHubs -join ', ')."; continue }
+        Invoke-Logged "$System32\sc.exe" @('delete', $svc)
     }
-    # Only the official USBip installer creates this. Cleaned up in case it was ever used.
-    $task = 'USBip Detach All On Reboot Or Shutdown'
-    if (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $task -Confirm:$false
-        Write-Log "Removed scheduled task `"$task`"."
+    foreach ($task in $Tasks) {
+        if (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false
+            Write-Log "Removed scheduled task `"$task`"."
+        }
     }
 
     Write-Log '--- Verification ---'
-    $hubs = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object InstanceId -like 'USB\ROOT_HUB30\*'
     $problems = @(
         Test-Leftover 'Driver packages' (Get-OwnDriverPackages | ForEach-Object { $_.Driver })
         Test-Leftover 'Device entries' (Get-OwnDevices $preexisting | ForEach-Object { $_.InstanceId })
         Test-Leftover 'Services' ($Services | Where-Object { Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$_" })
         Test-Leftover 'Driver store folders' (Get-ChildItem "$System32\DriverStore\FileRepository" -Directory -Filter 'usbip2_*' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
-        Test-Leftover 'Filter on USB root hubs' ($hubs | Where-Object {
-            (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_UpperFilters -ErrorAction SilentlyContinue).Data -contains 'usbip2_filter'
-        } | ForEach-Object { $_.InstanceId })
+        Test-Leftover 'Filter on USB root hubs' (Get-HubsWithFilter)
+        Test-Leftover 'Scheduled tasks' ($Tasks | Where-Object { Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue })
     ) | Where-Object { $_ }
 
     if ($problems) {
